@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+backend/node_modules/
+frontend/node_modules/
+
+Dockerfile
+# Env files
+.env
+.env.*
+backend/.env
+backend/.env.*
+frontend/.env
+frontend/.env.*
+
+# Build outputs
+dist/
+build/
+frontend/dist/
+backend/dist/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Docker / local data
+mysql-data/
+data/
+uploads/
+tmp/
+temp/
+
+# Cache
+.cache/
+.parcel-cache/
+.vite/
+
+# Coverage
+coverage/
+
+# Local database / backup files
+*.sqlite
+*.db
+*.sql.bak
+*.dump
