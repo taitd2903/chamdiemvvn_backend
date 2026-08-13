@@ -2,12 +2,22 @@ import { randomUUID } from 'node:crypto';
 import { AREA_STATUS, AREA_TYPES, FORM_ENTRY_STATUS, JUDGE_STATUS, MATCH_STATUS, db, getArea, getAreaState, touch } from './store.js';
 import { calculateFormFinalScore, clampScore, getSideLabel, getWinnerByScore } from './services/scoring.js';
 import { schedulePersistState } from './persistence.js';
+import { syncAreaBrackets, syncBracket } from './services/draw.js';
+import { getPublicTournamentState } from './services/publicStats.js';
 
 const timers = new Map();
 const medicalTimers = new Map();
 
+function advanceBracket(match) {
+  if (!match?.bracketId) return;
+  const bracket = db.brackets.find((row) => row.id === match.bracketId);
+  if (bracket) syncBracket(bracket);
+}
+
 function emitArea(io, areaId) {
+  syncAreaBrackets(areaId);
   io.to(`area:${areaId}`).emit('area:state', getAreaState(areaId));
+  io.emit('public:tournament', getPublicTournamentState());
   schedulePersistState(db);
 }
 
@@ -25,6 +35,13 @@ function findCurrentFormEntry(areaId) {
   const area = getArea(areaId);
   if (!area?.currentFormEntryId) return null;
   return db.formEntries.find((entry) => entry.id === area.currentFormEntryId) || null;
+}
+
+function matchHasPassedWeighIn(match) {
+  if (!match?.contentId || !match.redAthleteId || !match.blueAthleteId) return false;
+  return [match.redAthleteId, match.blueAthleteId].every((athleteId) =>
+    db.weighIns.some((row) => row.athleteId === athleteId && row.contentId === match.contentId && row.status === 'passed' && row.lockedAt)
+  );
 }
 
 function selectFormEntryForArea(areaId, entryId) {
@@ -79,6 +96,7 @@ function checkFightEnd(io, match) {
     match.winner = getWinnerByScore(match.redScore, match.blueScore);
     match.winReason = 'Điểm vàng';
     match.status = MATCH_STATUS.FINISHED;
+    advanceBracket(match);
     stopTimer(match.id);
     stopAllMedicalTimers(match);
     touch(match);
@@ -91,6 +109,7 @@ function checkFightEnd(io, match) {
     match.winner = getWinnerByScore(match.redScore, match.blueScore);
     match.winReason = 'Thắng chênh 10 điểm';
     match.status = MATCH_STATUS.FINISHED;
+    advanceBracket(match);
     stopTimer(match.id);
     stopAllMedicalTimers(match);
     touch(match);
@@ -102,6 +121,10 @@ function pushHistory(match, action) {
   match.history.push({
     id: randomUUID(),
     at: new Date().toISOString(),
+    round: match.round,
+    remainingSeconds: match.remainingSeconds,
+    redScoreAfter: match.redScore,
+    blueScoreAfter: match.blueScore,
     ...action
   });
 }
@@ -116,12 +139,40 @@ function pushUndoState(match, label) {
     reminders: JSON.parse(JSON.stringify(match.reminders || {})),
     medicalTimers: JSON.parse(JSON.stringify(match.medicalTimers || { red: 0, blue: 0 })),
     medicalPauseResume: Boolean(match.medicalPauseResume),
+    medicalCounts: JSON.parse(JSON.stringify(match.medicalCounts || {})),
+    round: match.round,
+    remainingSeconds: match.remainingSeconds,
+    goldenPoint: Boolean(match.goldenPoint),
     winner: match.winner,
     winReason: match.winReason,
     status: match.status,
     historyLength: match.history?.length || 0
   });
   if (match.undoStack.length > 50) match.undoStack.shift();
+}
+
+function resetFightTest(match) {
+  stopTimer(match.id);
+  stopAllMedicalTimers(match);
+  match.testMode = false;
+  match.status = MATCH_STATUS.PENDING;
+  match.round = 1;
+  match.remainingSeconds = match.roundSeconds;
+  match.redScore = 0;
+  match.blueScore = 0;
+  match.winner = null;
+  match.winReason = null;
+  match.goldenPoint = false;
+  match.reminders = { red: { fault: 0, medical: 0, warnings: 0 }, blue: { fault: 0, medical: 0, warnings: 0 } };
+  match.medicalTimers = { red: 0, blue: 0 };
+  match.medicalCounts = { red: { total: 0, byRound: {} }, blue: { total: 0, byRound: {} } };
+  match.medicalPauseResume = false;
+  match.pendingVotes = [];
+  match.voteFlashes = [];
+  match.processedVoteGroups = [];
+  match.history = [];
+  match.undoStack = [];
+  touch(match);
 }
 
 function applyScore(io, match, { side, points, source, label, voteIds = [] }) {
@@ -142,7 +193,7 @@ function applyScore(io, match, { side, points, source, label, voteIds = [] }) {
     voteIds
   });
   touch(match);
-  checkFightEnd(io, match);
+  if (!match.testMode) checkFightEnd(io, match);
 }
 
 function addReminder(io, match, side, kind) {
@@ -152,6 +203,32 @@ function addReminder(io, match, side, kind) {
   pushUndoState(match, `${getSideLabel(side)} nhắc ${kind === 'fault' ? 'lỗi' : 'y tế'}`);
 
   match.reminders[side][kind] += 1;
+  if (kind === 'medical') {
+    if (!match.medicalCounts) match.medicalCounts = { red: { total: 0, byRound: {} }, blue: { total: 0, byRound: {} } };
+    if (!match.medicalCounts[side]) match.medicalCounts[side] = { total: 0, byRound: {} };
+    const counter = match.medicalCounts[side];
+    counter.total += 1;
+    counter.byRound[match.round] = Number(counter.byRound[match.round] || 0) + 1;
+    const roundCount = counter.byRound[match.round];
+    pushHistory(match, {
+      type: 'medical', side, kind,
+      label: `${getSideLabel(side)} y tế lần ${roundCount} hiệp ${match.round} · tổng ${counter.total}/5`
+    });
+    if (!match.testMode && (roundCount >= 4 || counter.total >= 5)) {
+      const winner = side === 'red' ? 'blue' : 'red';
+      match.winner = winner;
+      match.winReason = roundCount >= 4 ? 'Đối thủ đủ 4 lần y tế trong một hiệp' : 'Đối thủ đủ 5 lần y tế toàn trận';
+      match.status = MATCH_STATUS.FINISHED;
+      stopTimer(match.id);
+      stopAllMedicalTimers(match);
+      advanceBracket(match);
+      pushHistory(match, { type: 'medical-loss', side, winner, label: `${getSideLabel(side)} bị xử thua do quá số lần y tế` });
+      touch(match);
+      return;
+    }
+    touch(match);
+    return;
+  }
   pushHistory(match, {
     type: 'reminder',
     side,
@@ -159,7 +236,7 @@ function addReminder(io, match, side, kind) {
     label: `${getSideLabel(side)} nhắc ${kind === 'fault' ? 'lỗi' : 'y tế'}`
   });
 
-  if (match.reminders[side][kind] >= 3) {
+  if (kind === 'fault' && match.reminders[side][kind] >= 3) {
     match.reminders[side][kind] = 0;
     match.reminders[side].warnings += 1;
     if (side === 'red') match.redScore -= 2;
@@ -174,7 +251,7 @@ function addReminder(io, match, side, kind) {
   }
 
   touch(match);
-  checkFightEnd(io, match);
+  if (!match.testMode) checkFightEnd(io, match);
 }
 
 function processVotes(io, match) {
@@ -248,7 +325,7 @@ function stopAllMedicalTimers(match) {
   match.medicalPauseResume = false;
 }
 
-function startMedicalTimer(io, match, side, durationSeconds = 30) {
+function startMedicalTimer(io, match, side, durationSeconds = 60) {
   if (!match.medicalTimers) match.medicalTimers = { red: 0, blue: 0 };
   const hadActiveMedical = Number(match.medicalTimers.red || 0) > 0 || Number(match.medicalTimers.blue || 0) > 0;
   if (!hadActiveMedical && [MATCH_STATUS.RUNNING, MATCH_STATUS.GOLDEN].includes(match.status)) {
@@ -262,7 +339,7 @@ function startMedicalTimer(io, match, side, durationSeconds = 30) {
     stopTimer(match.id);
   }
   stopMedicalTimer(match.id, side);
-  match.medicalTimers[side] = Math.max(1, Number(durationSeconds) || 30);
+  match.medicalTimers[side] = Math.max(1, Number(durationSeconds) || 60);
   touch(match);
   emitArea(io, match.areaId);
 
@@ -296,11 +373,11 @@ function startMedicalTimer(io, match, side, durationSeconds = 30) {
 
 function startTimer(io, match) {
   stopTimer(match.id);
-  if (![MATCH_STATUS.RUNNING, MATCH_STATUS.GOLDEN].includes(match.status)) return;
+  if (![MATCH_STATUS.RUNNING, MATCH_STATUS.GOLDEN, MATCH_STATUS.BREAK].includes(match.status)) return;
 
   timers.set(match.id, setInterval(() => {
     const freshMatch = db.fightMatches.find((row) => row.id === match.id);
-    if (!freshMatch || ![MATCH_STATUS.RUNNING, MATCH_STATUS.GOLDEN].includes(freshMatch.status)) {
+    if (!freshMatch || ![MATCH_STATUS.RUNNING, MATCH_STATUS.GOLDEN, MATCH_STATUS.BREAK].includes(freshMatch.status)) {
       stopTimer(match.id);
       return;
     }
@@ -312,18 +389,40 @@ function startTimer(io, match) {
       return;
     }
 
-    if (freshMatch.round >= freshMatch.maxRounds) {
-      if (freshMatch.redScore === freshMatch.blueScore) {
-        freshMatch.status = MATCH_STATUS.GOLDEN;
-        freshMatch.goldenPoint = true;
-        freshMatch.remainingSeconds = 0;
-        pushHistory(freshMatch, { type: 'golden', label: 'Hết hiệp cuối hòa → điểm vàng' });
-      } else {
-        freshMatch.winner = getWinnerByScore(freshMatch.redScore, freshMatch.blueScore);
-        freshMatch.winReason = 'Hết giờ';
-        freshMatch.status = MATCH_STATUS.FINISHED;
-        stopTimer(freshMatch.id);
+    if (freshMatch.status === MATCH_STATUS.BREAK) {
+      freshMatch.round += 1;
+      freshMatch.remainingSeconds = freshMatch.roundSeconds;
+      freshMatch.goldenPoint = freshMatch.round >= 4;
+      freshMatch.status = freshMatch.goldenPoint ? MATCH_STATUS.GOLDEN : MATCH_STATUS.RUNNING;
+      const area = getArea(freshMatch.areaId);
+      if (area) {
+        area.status = AREA_STATUS.FIGHTING_RUNNING;
+        touch(area);
       }
+      pushHistory(freshMatch, { type: 'round', label: `Bắt đầu ${freshMatch.goldenPoint ? 'hiệp phụ' : 'hiệp'} ${freshMatch.round}` });
+      touch(freshMatch);
+      emitArea(io, freshMatch.areaId);
+      return;
+    }
+
+    if (freshMatch.round === 3 && freshMatch.redScore !== freshMatch.blueScore) {
+      freshMatch.winner = getWinnerByScore(freshMatch.redScore, freshMatch.blueScore);
+      freshMatch.winReason = 'Hết 3 hiệp chính';
+      freshMatch.status = MATCH_STATUS.FINISHED;
+      advanceBracket(freshMatch);
+      stopTimer(freshMatch.id);
+      touch(freshMatch);
+      emitArea(io, freshMatch.areaId);
+      return;
+    }
+
+    if (freshMatch.round >= 9) {
+      freshMatch.status = MATCH_STATUS.DECISION;
+      freshMatch.remainingSeconds = 0;
+      stopTimer(freshMatch.id);
+      const area = getArea(freshMatch.areaId);
+      if (area) { area.status = AREA_STATUS.PAUSED; touch(area); }
+      pushHistory(freshMatch, { type: 'decision', label: 'Hết hiệp phụ 9 · chờ Tổng trọng tài quyết định' });
       touch(freshMatch);
       emitArea(io, freshMatch.areaId);
       return;
@@ -332,7 +431,11 @@ function startTimer(io, match) {
     freshMatch.status = MATCH_STATUS.BREAK;
     freshMatch.remainingSeconds = freshMatch.breakSeconds;
     pushHistory(freshMatch, { type: 'break', label: `Nghỉ giữa hiệp ${freshMatch.round}` });
-    stopTimer(freshMatch.id);
+    const area = getArea(freshMatch.areaId);
+    if (area) {
+      area.status = AREA_STATUS.PAUSED;
+      touch(area);
+    }
     touch(freshMatch);
     emitArea(io, freshMatch.areaId);
   }, 1000));
@@ -528,7 +631,7 @@ export function setupSocket(io) {
       if (!area || area.type !== AREA_TYPES.FIGHTING) return emitError(socket, 'Sân Đối kháng không hợp lệ');
       if (!match) return emitError(socket, 'Không tìm thấy trận');
       const current = findCurrentMatch(areaId);
-      if (current && current.id !== match.id && [MATCH_STATUS.RUNNING, MATCH_STATUS.PAUSED, MATCH_STATUS.GOLDEN].includes(current.status)) {
+      if (current && current.id !== match.id && [MATCH_STATUS.RUNNING, MATCH_STATUS.PAUSED, MATCH_STATUS.GOLDEN, MATCH_STATUS.DECISION].includes(current.status)) {
         return emitError(socket, 'Không thể chuyển trận khi trận hiện tại chưa kết thúc/hủy/tạm bỏ qua');
       }
       area.currentFightMatchId = match.id;
@@ -543,9 +646,14 @@ export function setupSocket(io) {
       const area = getArea(areaId);
       const match = findCurrentMatch(areaId);
       if (!area || area.type !== AREA_TYPES.FIGHTING || !match) return emitError(socket, 'Chưa chọn trận Đối kháng');
+      if (match.testMode) resetFightTest(match);
       if ([MATCH_STATUS.FINISHED, MATCH_STATUS.CANCELLED].includes(match.status)) return emitError(socket, 'Trận đã kết thúc/hủy');
+      if (match.status === MATCH_STATUS.DECISION) return emitError(socket, 'Đang chờ Tổng trọng tài quyết định kết quả');
+      if (!matchHasPassedWeighIn(match)) return emitError(socket, 'Chỉ được bắt đầu khi cả hai VĐV đã kiểm tra và đủ cân');
+      if (match.status === MATCH_STATUS.BREAK) return emitError(socket, 'Đang trong thời gian nghỉ giữa hiệp');
       if (Number(match.medicalTimers?.red || 0) > 0 || Number(match.medicalTimers?.blue || 0) > 0) return emitError(socket, 'Đang trong thời gian y tế');
       match.status = match.goldenPoint ? MATCH_STATUS.GOLDEN : MATCH_STATUS.RUNNING;
+      match.hasStarted = true;
       area.status = AREA_STATUS.FIGHTING_RUNNING;
       touch(match);
       touch(area);
@@ -553,10 +661,29 @@ export function setupSocket(io) {
       emitArea(io, areaId);
     });
 
+    socket.on('fight:test-mode', ({ areaId, enabled }) => {
+      const area = getArea(areaId);
+      const match = findCurrentMatch(areaId);
+      if (!area || area.type !== AREA_TYPES.FIGHTING || !match) return emitError(socket, 'Chưa chọn trận Đối kháng');
+      if (match.hasStarted && !match.testMode) return emitError(socket, 'Trận đã bắt đầu, không thể bật test điểm');
+      if (enabled) {
+        if (match.status !== MATCH_STATUS.PENDING || match.hasStarted) return emitError(socket, 'Chỉ test điểm trước khi bắt đầu trận');
+        match.testMode = true;
+        pushHistory(match, { type: 'test', label: 'Bắt đầu test điểm' });
+        touch(match);
+      } else {
+        resetFightTest(match);
+      }
+      area.status = AREA_STATUS.IDLE;
+      touch(area);
+      emitArea(io, areaId);
+    });
+
     socket.on('fight:pause', ({ areaId }) => {
       const area = getArea(areaId);
       const match = findCurrentMatch(areaId);
       if (!area || !match) return;
+      if (match.status === MATCH_STATUS.DECISION) return emitError(socket, 'Đang chờ Tổng trọng tài quyết định kết quả');
       match.status = MATCH_STATUS.PAUSED;
       area.status = AREA_STATUS.PAUSED;
       stopTimer(match.id);
@@ -569,6 +696,7 @@ export function setupSocket(io) {
       const area = getArea(areaId);
       const match = findCurrentMatch(areaId);
       if (!area || !match) return;
+      if (match.status === MATCH_STATUS.DECISION) return emitError(socket, 'Đang chờ Tổng trọng tài quyết định kết quả');
       if (Number(match.medicalTimers?.red || 0) > 0 || Number(match.medicalTimers?.blue || 0) > 0) return emitError(socket, 'Đang trong thời gian y tế');
       match.status = match.goldenPoint ? MATCH_STATUS.GOLDEN : MATCH_STATUS.RUNNING;
       area.status = AREA_STATUS.FIGHTING_RUNNING;
@@ -581,14 +709,34 @@ export function setupSocket(io) {
     socket.on('fight:next-round', ({ areaId }) => {
       const match = findCurrentMatch(areaId);
       if (!match) return emitError(socket, 'Chưa chọn trận');
-      if (match.round >= match.maxRounds) return emitError(socket, 'Đã là hiệp cuối');
+      if (match.testMode) return emitError(socket, 'Hãy tắt test điểm trước khi đổi hiệp');
+      if (match.round >= 9) return emitError(socket, 'Đã là hiệp cuối');
       match.round += 1;
       match.remainingSeconds = match.roundSeconds;
       match.status = MATCH_STATUS.PAUSED;
-      match.goldenPoint = false;
+      match.goldenPoint = match.round >= 4;
       pushHistory(match, { type: 'round', label: `Sang hiệp ${match.round}` });
       stopTimer(match.id);
       touch(match);
+      emitArea(io, areaId);
+    });
+
+    socket.on('fight:previous-round', ({ areaId }) => {
+      const area = getArea(areaId);
+      const match = findCurrentMatch(areaId);
+      if (!area || !match) return emitError(socket, 'Chưa chọn trận');
+      if ([MATCH_STATUS.FINISHED, MATCH_STATUS.CANCELLED, MATCH_STATUS.DECISION].includes(match.status)) return emitError(socket, 'Không thể quay hiệp khi trận đã kết thúc');
+      if (match.round <= 1) return emitError(socket, 'Đang ở hiệp đầu tiên');
+      stopTimer(match.id);
+      stopAllMedicalTimers(match);
+      match.round -= 1;
+      match.remainingSeconds = match.roundSeconds;
+      match.status = MATCH_STATUS.PAUSED;
+      match.goldenPoint = match.round >= 4;
+      area.status = AREA_STATUS.PAUSED;
+      pushHistory(match, { type: 'round', label: `Quay lại hiệp ${match.round}` });
+      touch(match);
+      touch(area);
       emitArea(io, areaId);
     });
 
@@ -616,11 +764,17 @@ export function setupSocket(io) {
     socket.on('fight:manual-score', ({ areaId, side, points }) => {
       const match = findCurrentMatch(areaId);
       if (!match) return emitError(socket, 'Chưa chọn trận');
+      if (match.status === MATCH_STATUS.DECISION) return emitError(socket, 'Hiệp 9 đã kết thúc, hãy chọn trực tiếp bên thắng');
+      if ([MATCH_STATUS.FINISHED, MATCH_STATUS.CANCELLED].includes(match.status)) return emitError(socket, 'Trận đã kết thúc/hủy');
+      if (!match.testMode && match.status === MATCH_STATUS.PENDING) return emitError(socket, 'Hãy bắt đầu trận hoặc bật test điểm trước khi chấm');
+      if (![-2, -1, 1, 2, 3].includes(Number(points))) return emitError(socket, 'Mức điểm của Tổng trọng tài không hợp lệ');
       applyScore(io, match, {
         side,
         points: Number(points),
         source: 'referee',
-        label: `${getSideLabel(side)} ${Number(points) > 0 ? '+' : ''}${Number(points)} do tổng trọng tài`
+        label: Number(points) === 3
+          ? `${getSideLabel(side)} +3 · Đòn chân thành công tuyệt đối`
+          : `${getSideLabel(side)} ${Number(points) > 0 ? '+' : ''}${Number(points)} do tổng trọng tài`
       });
       emitArea(io, areaId);
     });
@@ -628,6 +782,9 @@ export function setupSocket(io) {
     socket.on('fight:reminder', ({ areaId, side, kind }) => {
       const match = findCurrentMatch(areaId);
       if (!match) return emitError(socket, 'Chưa chọn trận');
+      if (match.status === MATCH_STATUS.DECISION) return emitError(socket, 'Hiệp 9 đã kết thúc, hãy chọn trực tiếp bên thắng');
+      if ([MATCH_STATUS.FINISHED, MATCH_STATUS.CANCELLED].includes(match.status)) return emitError(socket, 'Trận đã kết thúc/hủy');
+      if (!match.testMode && match.status === MATCH_STATUS.PENDING) return emitError(socket, 'Hãy bắt đầu trận hoặc bật test điểm trước khi thao tác');
       addReminder(io, match, side, kind);
       if (kind === 'medical' && ![MATCH_STATUS.FINISHED, MATCH_STATUS.CANCELLED].includes(match.status)) startMedicalTimer(io, match, side);
       emitArea(io, areaId);
@@ -637,7 +794,7 @@ export function setupSocket(io) {
       const area = getArea(areaId);
       const match = findCurrentMatch(areaId);
       if (!area || !match) return emitError(socket, 'Chưa chọn trận');
-      if (![MATCH_STATUS.RUNNING, MATCH_STATUS.GOLDEN].includes(match.status)) return emitError(socket, 'Trận chưa chạy hoặc đang tạm dừng');
+      if (!match.testMode && ![MATCH_STATUS.RUNNING, MATCH_STATUS.GOLDEN].includes(match.status)) return emitError(socket, 'Trận chưa chạy hoặc đang tạm dừng');
       if (![1, 2].includes(Number(points))) return emitError(socket, 'Giám định chỉ được bấm +1 hoặc +2');
       if (!['red', 'blue'].includes(side)) return emitError(socket, 'Bên điểm không hợp lệ');
       const no = Number(judgeNo);
@@ -677,14 +834,18 @@ export function setupSocket(io) {
       const area = getArea(areaId);
       const match = findCurrentMatch(areaId);
       if (!area || !match) return;
+      if (match.testMode) return emitError(socket, 'Hãy tắt test điểm trước khi quyết định người thắng');
+      if (!['red', 'blue'].includes(winner)) return emitError(socket, 'Bên thắng không hợp lệ');
+      if ([MATCH_STATUS.PENDING, MATCH_STATUS.FINISHED, MATCH_STATUS.CANCELLED].includes(match.status)) return emitError(socket, 'Trận chưa bắt đầu hoặc đã kết thúc');
       pushUndoState(match, `${getSideLabel(winner)} thắng trực tiếp`);
       match.winner = winner;
       match.winReason = reason;
       match.status = MATCH_STATUS.FINISHED;
+      advanceBracket(match);
       area.status = AREA_STATUS.IDLE;
       stopTimer(match.id);
       stopAllMedicalTimers(match);
-      pushHistory(match, { type: 'win', winner, label: `${getSideLabel(winner)} thắng trực tiếp` });
+      pushHistory(match, { type: 'win', side: winner, winner, source: 'referee', label: `${getSideLabel(winner)} thắng trực tiếp` });
       touch(match);
       touch(area);
       emitArea(io, areaId);
@@ -694,9 +855,12 @@ export function setupSocket(io) {
       const area = getArea(areaId);
       const match = findCurrentMatch(areaId);
       if (!area || !match) return;
+      if ([MATCH_STATUS.PENDING, MATCH_STATUS.FINISHED, MATCH_STATUS.CANCELLED].includes(match.status)) return emitError(socket, 'Trận chưa bắt đầu hoặc đã kết thúc');
+      if (match.redScore === match.blueScore) return emitError(socket, 'Trận đang hòa; tiếp tục hiệp phụ hoặc chọn người thắng khi chờ quyết định');
       match.winner = getWinnerByScore(match.redScore, match.blueScore);
       match.winReason = match.winner ? 'Kết thúc trận' : 'Hòa - cần xử lý';
       match.status = MATCH_STATUS.FINISHED;
+      advanceBracket(match);
       area.status = AREA_STATUS.IDLE;
       stopTimer(match.id);
       stopAllMedicalTimers(match);
@@ -734,11 +898,16 @@ export function setupSocket(io) {
       match.reminders = snapshot.reminders;
       match.medicalTimers = snapshot.medicalTimers;
       match.medicalPauseResume = snapshot.medicalPauseResume;
+      match.medicalCounts = snapshot.medicalCounts;
+      match.round = snapshot.round;
+      match.remainingSeconds = snapshot.remainingSeconds;
+      match.goldenPoint = snapshot.goldenPoint;
       match.winner = snapshot.winner;
       match.winReason = snapshot.winReason;
       match.status = snapshot.status;
-      match.history = (match.history || []).slice(0, snapshot.historyLength);
-      pushHistory(match, { type: 'undo', label: `Hoàn tác hành động: ${snapshot.label}` });
+      const undoneItems = (match.history || []).slice(snapshot.historyLength);
+      undoneItems.forEach((item) => { item.undone = true; item.undoneAt = new Date().toISOString(); });
+      pushHistory(match, { type: 'undo', side: undoneItems.find((item) => item.side)?.side, source: 'referee', label: `Hoàn tác hành động: ${snapshot.label}` });
 
       if (area) {
         area.status = [MATCH_STATUS.RUNNING, MATCH_STATUS.GOLDEN].includes(match.status)

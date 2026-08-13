@@ -28,6 +28,7 @@ export const MATCH_STATUS = {
   PAUSED: 'paused',
   BREAK: 'break',
   GOLDEN: 'golden',
+  DECISION: 'decision',
   SKIPPED: 'skipped',
   FINISHED: 'finished',
   CANCELLED: 'cancelled'
@@ -258,6 +259,9 @@ function createSeedState() {
       tournamentName: 'GIẢI VOVINAM HỌC SINH PHƯỜNG TÙNG THIỆN NH 2025-2026',
       logoLeftUrl: '',
       logoRightUrl: '',
+      formContentLimitPerUnit: null,
+      fightingContentLimitPerUnit: null,
+      registrationLocked: false,
       updatedAt: now()
     },
     areas: [areaA, areaB],
@@ -309,6 +313,10 @@ function createSeedState() {
       { id: randomUUID(), name: 'Lê Văn C', unit: 'CLB C', birthYear: 2012, gender: 'male', weightKg: 38, weightClass: '', ageGroup: 'Lứa tuổi 1', createdAt: now(), updatedAt: now() }
     ],
     registrations: [],
+    users: [],
+    sessions: [],
+    brackets: [],
+    weighIns: [],
     formEntries,
     fightMatches
   };
@@ -337,6 +345,8 @@ export function createFightMatch({ id = randomUUID(), contentId = null, areaId, 
     redAgeGroup: redAgeGroup || deriveAgeGroup(redBirthYear),
     blueAgeGroup: blueAgeGroup || deriveAgeGroup(blueBirthYear),
     status: MATCH_STATUS.PENDING,
+    testMode: false,
+    hasStarted: false,
     round: 1,
     maxRounds: Math.max(1, Number(maxRounds) || 3),
     roundSeconds: Math.max(1, Number(roundSeconds) || 120),
@@ -352,6 +362,7 @@ export function createFightMatch({ id = randomUUID(), contentId = null, areaId, 
       blue: { fault: 0, medical: 0, warnings: 0 }
     },
     medicalTimers: { red: 0, blue: 0 },
+    medicalCounts: { red: { total: 0, byRound: {} }, blue: { total: 0, byRound: {} } },
     medicalPauseResume: false,
     pendingVotes: [],
     voteFlashes: [],
@@ -423,6 +434,8 @@ export function getGlobalState() {
     registrations: db.registrations,
     formEntries: db.formEntries,
     fightMatches: db.fightMatches
+    ,brackets: db.brackets,
+    weighIns: db.weighIns
   };
 }
 
@@ -438,6 +451,9 @@ export function resetTournamentData() {
   db.registrations = [];
   db.formEntries = [];
   db.fightMatches = [];
+  db.brackets = [];
+  db.weighIns = [];
+  db.settings.registrationLocked = false;
 
   db.areas.forEach((area) => {
     area.status = AREA_STATUS.IDLE;
@@ -449,4 +465,22 @@ export function resetTournamentData() {
 
   touchSettings();
   return getGlobalState();
+}
+
+export function clearFightingData() {
+  const removedMatches = db.fightMatches.length;
+  const removedBrackets = db.brackets.length;
+  db.fightMatches = [];
+  db.brackets = [];
+
+  db.areas.forEach((area) => {
+    if (area.currentFightMatchId || area.type === AREA_TYPES.FIGHTING) {
+      area.currentFightMatchId = null;
+      area.status = AREA_STATUS.IDLE;
+      touch(area);
+    }
+  });
+
+  touchSettings();
+  return { removedMatches, removedBrackets, state: getGlobalState() };
 }

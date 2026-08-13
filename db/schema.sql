@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS contents (
 
 CREATE TABLE IF NOT EXISTS athletes (
   id VARCHAR(64) PRIMARY KEY,
+  owner_id VARCHAR(64) NULL,
   name VARCHAR(255) NOT NULL,
   unit VARCHAR(255) NULL,
   birth_year INT NULL,
@@ -84,6 +85,19 @@ CREATE TABLE IF NOT EXISTS athletes (
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS users (
+  id VARCHAR(64) PRIMARY KEY,
+  username VARCHAR(255) NOT NULL UNIQUE,
+  password_hash VARCHAR(255) NOT NULL,
+  display_name VARCHAR(255) NOT NULL,
+  unit_name VARCHAR(255) NULL,
+  role ENUM('admin', 'unit_owner', 'weigh_in') NOT NULL,
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
 
 CREATE TABLE IF NOT EXISTS registrations (
   id VARCHAR(64) PRIMARY KEY,
@@ -148,7 +162,7 @@ CREATE TABLE IF NOT EXISTS fight_matches (
   blue_weight_class VARCHAR(255) NULL,
   red_age_group VARCHAR(255) NULL,
   blue_age_group VARCHAR(255) NULL,
-  status ENUM('pending', 'running', 'paused', 'break', 'golden', 'skipped', 'finished', 'cancelled') NOT NULL DEFAULT 'pending',
+  status ENUM('pending', 'running', 'paused', 'break', 'golden', 'decision', 'skipped', 'finished', 'cancelled') NOT NULL DEFAULT 'pending',
   round_no INT NOT NULL DEFAULT 1,
   max_rounds INT NOT NULL DEFAULT 3,
   round_seconds INT NOT NULL DEFAULT 120,

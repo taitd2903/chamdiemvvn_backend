@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { AREA_STATUS, AREA_TYPES, db, getArea, getAreaState, makeId, publicArea, resetJudgeSlots, touch } from '../store.js';
+import { syncAreaBrackets } from '../services/draw.js';
 
 export function areasRouter(io) {
   const router = Router();
@@ -9,6 +10,7 @@ export function areasRouter(io) {
   });
 
   router.get('/:areaId', (req, res) => {
+    syncAreaBrackets(req.params.areaId);
     const state = getAreaState(req.params.areaId);
     if (!state) return res.status(404).json({ message: 'Không tìm thấy sân' });
     return res.json(state);

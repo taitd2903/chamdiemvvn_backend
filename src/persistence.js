@@ -24,6 +24,10 @@ function applyLoadedState(target, loaded) {
   target.contents = Array.isArray(safe.contents) ? safe.contents : target.contents;
   target.athletes = Array.isArray(safe.athletes) ? safe.athletes : target.athletes;
   target.registrations = Array.isArray(safe.registrations) ? safe.registrations : target.registrations;
+  target.users = Array.isArray(safe.users) ? safe.users : target.users;
+  target.sessions = Array.isArray(safe.sessions) ? safe.sessions : target.sessions;
+  target.brackets = Array.isArray(safe.brackets) ? safe.brackets : target.brackets;
+  target.weighIns = Array.isArray(safe.weighIns) ? safe.weighIns : target.weighIns;
   target.formEntries = Array.isArray(safe.formEntries) ? safe.formEntries : target.formEntries;
   target.fightMatches = Array.isArray(safe.fightMatches) ? safe.fightMatches : target.fightMatches;
 }
@@ -35,6 +39,17 @@ async function runSqlFileIfExists(connection, filePath) {
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
+}
+
+async function runMigrationIfNeeded(connection, migrationId, filePath) {
+  await connection.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
+    id VARCHAR(255) PRIMARY KEY,
+    applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+  const [rows] = await connection.query('SELECT id FROM schema_migrations WHERE id = ?', [migrationId]);
+  if (rows.length) return;
+  await runSqlFileIfExists(connection, filePath);
+  await connection.query('INSERT INTO schema_migrations (id) VALUES (?)', [migrationId]);
 }
 
 export function isPersistenceEnabled() {
@@ -69,6 +84,9 @@ export async function initPersistence(state) {
     await connection.query('SELECT 1');
     const schemaPath = path.resolve(process.cwd(), 'db/schema.sql');
     await runSqlFileIfExists(connection, schemaPath);
+    const migrationId = '20260813_production_sync';
+    const migrationPath = path.resolve(process.cwd(), `db/migrations/${migrationId}.sql`);
+    await runMigrationIfNeeded(connection, migrationId, migrationPath);
     await connection.query(`
       CREATE TABLE IF NOT EXISTS app_state (
         id VARCHAR(64) PRIMARY KEY,
