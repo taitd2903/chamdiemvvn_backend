@@ -13,7 +13,7 @@ export function fightingRouter(io) {
   });
 
   router.post('/matches', (req, res) => {
-    const { areaId, contentId, redAthleteId, blueAthleteId, redName, blueName, orderNo, roundSeconds = 120, breakSeconds = 45, maxRounds = 3 } = req.body;
+    const { areaId, contentId, redAthleteId, blueAthleteId, redName, blueName, orderNo, roundSeconds, breakSeconds, maxRounds } = req.body;
     const area = getArea(areaId);
     const content = db.contents.find((row) => row.id === contentId);
     if (!area || area.type !== AREA_TYPES.FIGHTING) return res.status(400).json({ message: 'Sân Đối kháng không hợp lệ' });
@@ -47,9 +47,9 @@ export function fightingRouter(io) {
       redAgeGroup: red.ageGroup,
       blueAgeGroup: blue.ageGroup,
       orderNo: Number(orderNo) || db.fightMatches.filter((row) => row.areaId === areaId).length + 1,
-      roundSeconds: Number(roundSeconds) || 120,
-      breakSeconds: Math.max(0, Number(breakSeconds) || 0),
-      maxRounds: Number(maxRounds) || 3
+      roundSeconds: Math.max(1, Number(roundSeconds ?? area.roundSeconds) || 120),
+      breakSeconds: Math.max(0, Number(breakSeconds ?? area.breakSeconds) || 0),
+      maxRounds: Math.max(1, Number(maxRounds ?? area.maxRounds) || 3)
     });
     db.fightMatches.push(match);
     io.to(`area:${areaId}`).emit('area:state', getAreaState(areaId));

@@ -15,7 +15,7 @@ export function areasRouter(io) {
   });
 
   router.post('/', (req, res) => {
-    const { name, type, judgeCount } = req.body;
+    const { name, type, judgeCount, maxRounds, roundSeconds, breakSeconds } = req.body;
     if (!name || ![AREA_TYPES.FORM, AREA_TYPES.FIGHTING].includes(type)) {
       return res.status(400).json({ message: 'Tên sân hoặc loại sân không hợp lệ' });
     }
@@ -31,6 +31,9 @@ export function areasRouter(io) {
       type,
       status: AREA_STATUS.IDLE,
       judgeCount: normalizedJudgeCount,
+      maxRounds: type === AREA_TYPES.FIGHTING ? Math.max(1, Number(maxRounds) || 3) : null,
+      roundSeconds: type === AREA_TYPES.FIGHTING ? Math.max(1, Number(roundSeconds) || 120) : null,
+      breakSeconds: type === AREA_TYPES.FIGHTING ? Math.max(0, Number(breakSeconds) || 0) : null,
       judgeSlots: {},
       currentFormEntryId: null,
       currentFightMatchId: null,
@@ -48,11 +51,16 @@ export function areasRouter(io) {
     const area = getArea(req.params.areaId);
     if (!area) return res.status(404).json({ message: 'Không tìm thấy sân' });
 
-    const { name, status, judgeCount } = req.body;
+    const { name, status, judgeCount, maxRounds, roundSeconds, breakSeconds } = req.body;
     if (name) area.name = name;
     if (status) area.status = status;
     if (area.type === AREA_TYPES.FIGHTING && judgeCount && [4, 5].includes(Number(judgeCount))) {
       resetJudgeSlots(area, Number(judgeCount));
+    }
+    if (area.type === AREA_TYPES.FIGHTING) {
+      if (maxRounds !== undefined) area.maxRounds = Math.max(1, Number(maxRounds) || 1);
+      if (roundSeconds !== undefined) area.roundSeconds = Math.max(1, Number(roundSeconds) || 1);
+      if (breakSeconds !== undefined) area.breakSeconds = Math.max(0, Number(breakSeconds) || 0);
     }
     touch(area);
 
@@ -82,6 +90,9 @@ export function areasRouter(io) {
     area.currentFormEntryId = null;
     area.currentFightMatchId = null;
     const normalizedJudgeCount = type === AREA_TYPES.FORM ? 5 : Number(judgeCount || 5);
+    area.maxRounds = type === AREA_TYPES.FIGHTING ? Math.max(1, Number(req.body.maxRounds) || 3) : null;
+    area.roundSeconds = type === AREA_TYPES.FIGHTING ? Math.max(1, Number(req.body.roundSeconds) || 120) : null;
+    area.breakSeconds = type === AREA_TYPES.FIGHTING ? Math.max(0, Number(req.body.breakSeconds) || 0) : null;
     resetJudgeSlots(area, normalizedJudgeCount);
     touch(area);
 
