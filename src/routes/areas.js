@@ -21,8 +21,8 @@ export function areasRouter(io) {
     }
 
     const normalizedJudgeCount = type === AREA_TYPES.FORM ? 5 : Number(judgeCount || 5);
-    if (type === AREA_TYPES.FIGHTING && ![4, 5].includes(normalizedJudgeCount)) {
-      return res.status(400).json({ message: 'Đối kháng chỉ hỗ trợ 4 hoặc 5 giám định' });
+    if (type === AREA_TYPES.FIGHTING && ![3, 5].includes(normalizedJudgeCount)) {
+      return res.status(400).json({ message: 'Đối kháng chỉ hỗ trợ 3 hoặc 5 giám định' });
     }
 
     const area = {
@@ -54,7 +54,7 @@ export function areasRouter(io) {
     const { name, status, judgeCount, maxRounds, roundSeconds, breakSeconds } = req.body;
     if (name) area.name = name;
     if (status) area.status = status;
-    if (area.type === AREA_TYPES.FIGHTING && judgeCount && [4, 5].includes(Number(judgeCount))) {
+    if (area.type === AREA_TYPES.FIGHTING && judgeCount && [3, 5].includes(Number(judgeCount))) {
       resetJudgeSlots(area, Number(judgeCount));
     }
     if (area.type === AREA_TYPES.FIGHTING) {
@@ -85,11 +85,14 @@ export function areasRouter(io) {
       });
     }
 
+    const normalizedJudgeCount = type === AREA_TYPES.FORM ? 5 : Number(judgeCount || 5);
+    if (type === AREA_TYPES.FIGHTING && ![3, 5].includes(normalizedJudgeCount)) {
+      return res.status(400).json({ message: 'Đối kháng chỉ hỗ trợ 3 hoặc 5 giám định' });
+    }
     area.type = type;
     area.status = AREA_STATUS.IDLE;
     area.currentFormEntryId = null;
     area.currentFightMatchId = null;
-    const normalizedJudgeCount = type === AREA_TYPES.FORM ? 5 : Number(judgeCount || 5);
     area.maxRounds = type === AREA_TYPES.FIGHTING ? Math.max(1, Number(req.body.maxRounds) || 3) : null;
     area.roundSeconds = type === AREA_TYPES.FIGHTING ? Math.max(1, Number(req.body.roundSeconds) || 120) : null;
     area.breakSeconds = type === AREA_TYPES.FIGHTING ? Math.max(0, Number(req.body.breakSeconds) || 0) : null;

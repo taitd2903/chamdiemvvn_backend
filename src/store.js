@@ -351,10 +351,13 @@ export function createFightMatch({ id = randomUUID(), contentId = null, areaId, 
       red: { fault: 0, medical: 0, warnings: 0 },
       blue: { fault: 0, medical: 0, warnings: 0 }
     },
+    medicalTimers: { red: 0, blue: 0 },
+    medicalPauseResume: false,
     pendingVotes: [],
     voteFlashes: [],
     processedVoteGroups: [],
     history: [],
+    undoStack: [],
     createdAt: now(),
     updatedAt: now()
   };

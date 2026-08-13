@@ -4,6 +4,7 @@ import { calculateFormFinalScore, clampScore, getSideLabel, getWinnerByScore } f
 import { schedulePersistState } from './persistence.js';
 
 const timers = new Map();
+const medicalTimers = new Map();
 
 function emitArea(io, areaId) {
   io.to(`area:${areaId}`).emit('area:state', getAreaState(areaId));
@@ -79,6 +80,7 @@ function checkFightEnd(io, match) {
     match.winReason = 'Điểm vàng';
     match.status = MATCH_STATUS.FINISHED;
     stopTimer(match.id);
+    stopAllMedicalTimers(match);
     touch(match);
     emitArea(io, match.areaId);
     return;
@@ -90,6 +92,7 @@ function checkFightEnd(io, match) {
     match.winReason = 'Thắng chênh 10 điểm';
     match.status = MATCH_STATUS.FINISHED;
     stopTimer(match.id);
+    stopAllMedicalTimers(match);
     touch(match);
     emitArea(io, match.areaId);
   }
@@ -103,9 +106,29 @@ function pushHistory(match, action) {
   });
 }
 
+function pushUndoState(match, label) {
+  if (!Array.isArray(match.undoStack)) match.undoStack = [];
+  match.undoStack.push({
+    id: randomUUID(),
+    label,
+    redScore: match.redScore,
+    blueScore: match.blueScore,
+    reminders: JSON.parse(JSON.stringify(match.reminders || {})),
+    medicalTimers: JSON.parse(JSON.stringify(match.medicalTimers || { red: 0, blue: 0 })),
+    medicalPauseResume: Boolean(match.medicalPauseResume),
+    winner: match.winner,
+    winReason: match.winReason,
+    status: match.status,
+    historyLength: match.history?.length || 0
+  });
+  if (match.undoStack.length > 50) match.undoStack.shift();
+}
+
 function applyScore(io, match, { side, points, source, label, voteIds = [] }) {
   const delta = Number(points);
   if (!['red', 'blue'].includes(side) || !Number.isFinite(delta)) return;
+
+  pushUndoState(match, label || `${getSideLabel(side)} ${delta > 0 ? '+' : ''}${delta}`);
 
   if (side === 'red') match.redScore += delta;
   if (side === 'blue') match.blueScore += delta;
@@ -125,6 +148,8 @@ function applyScore(io, match, { side, points, source, label, voteIds = [] }) {
 function addReminder(io, match, side, kind) {
   if (!['red', 'blue'].includes(side)) return;
   if (!['fault', 'medical'].includes(kind)) return;
+
+  pushUndoState(match, `${getSideLabel(side)} nhắc ${kind === 'fault' ? 'lỗi' : 'y tế'}`);
 
   match.reminders[side][kind] += 1;
   pushHistory(match, {
@@ -202,6 +227,71 @@ function stopTimer(matchId) {
   const timer = timers.get(matchId);
   if (timer) clearInterval(timer);
   timers.delete(matchId);
+}
+
+function medicalTimerKey(matchId, side) {
+  return `${matchId}:${side}`;
+}
+
+function stopMedicalTimer(matchId, side) {
+  const key = medicalTimerKey(matchId, side);
+  const timer = medicalTimers.get(key);
+  if (timer) clearInterval(timer);
+  medicalTimers.delete(key);
+}
+
+function stopAllMedicalTimers(match) {
+  if (!match) return;
+  stopMedicalTimer(match.id, 'red');
+  stopMedicalTimer(match.id, 'blue');
+  match.medicalTimers = { red: 0, blue: 0 };
+  match.medicalPauseResume = false;
+}
+
+function startMedicalTimer(io, match, side, durationSeconds = 30) {
+  if (!match.medicalTimers) match.medicalTimers = { red: 0, blue: 0 };
+  const hadActiveMedical = Number(match.medicalTimers.red || 0) > 0 || Number(match.medicalTimers.blue || 0) > 0;
+  if (!hadActiveMedical && [MATCH_STATUS.RUNNING, MATCH_STATUS.GOLDEN].includes(match.status)) {
+    match.medicalPauseResume = true;
+    match.status = MATCH_STATUS.PAUSED;
+    const area = getArea(match.areaId);
+    if (area) {
+      area.status = AREA_STATUS.PAUSED;
+      touch(area);
+    }
+    stopTimer(match.id);
+  }
+  stopMedicalTimer(match.id, side);
+  match.medicalTimers[side] = Math.max(1, Number(durationSeconds) || 30);
+  touch(match);
+  emitArea(io, match.areaId);
+
+  const key = medicalTimerKey(match.id, side);
+  medicalTimers.set(key, setInterval(() => {
+    const freshMatch = db.fightMatches.find((row) => row.id === match.id);
+    if (!freshMatch) {
+      stopMedicalTimer(match.id, side);
+      return;
+    }
+    if (!freshMatch.medicalTimers) freshMatch.medicalTimers = { red: 0, blue: 0 };
+    freshMatch.medicalTimers[side] = Math.max(0, Number(freshMatch.medicalTimers[side] || 0) - 1);
+    touch(freshMatch);
+    if (freshMatch.medicalTimers[side] === 0) {
+      stopMedicalTimer(match.id, side);
+      const otherSide = side === 'red' ? 'blue' : 'red';
+      if (Number(freshMatch.medicalTimers[otherSide] || 0) === 0 && freshMatch.medicalPauseResume) {
+        freshMatch.medicalPauseResume = false;
+        freshMatch.status = freshMatch.goldenPoint ? MATCH_STATUS.GOLDEN : MATCH_STATUS.RUNNING;
+        const area = getArea(freshMatch.areaId);
+        if (area) {
+          area.status = AREA_STATUS.FIGHTING_RUNNING;
+          touch(area);
+        }
+        startTimer(io, freshMatch);
+      }
+    }
+    emitArea(io, freshMatch.areaId);
+  }, 1000));
 }
 
 function startTimer(io, match) {
@@ -454,6 +544,7 @@ export function setupSocket(io) {
       const match = findCurrentMatch(areaId);
       if (!area || area.type !== AREA_TYPES.FIGHTING || !match) return emitError(socket, 'Chưa chọn trận Đối kháng');
       if ([MATCH_STATUS.FINISHED, MATCH_STATUS.CANCELLED].includes(match.status)) return emitError(socket, 'Trận đã kết thúc/hủy');
+      if (Number(match.medicalTimers?.red || 0) > 0 || Number(match.medicalTimers?.blue || 0) > 0) return emitError(socket, 'Đang trong thời gian y tế');
       match.status = match.goldenPoint ? MATCH_STATUS.GOLDEN : MATCH_STATUS.RUNNING;
       area.status = AREA_STATUS.FIGHTING_RUNNING;
       touch(match);
@@ -478,6 +569,7 @@ export function setupSocket(io) {
       const area = getArea(areaId);
       const match = findCurrentMatch(areaId);
       if (!area || !match) return;
+      if (Number(match.medicalTimers?.red || 0) > 0 || Number(match.medicalTimers?.blue || 0) > 0) return emitError(socket, 'Đang trong thời gian y tế');
       match.status = match.goldenPoint ? MATCH_STATUS.GOLDEN : MATCH_STATUS.RUNNING;
       area.status = AREA_STATUS.FIGHTING_RUNNING;
       touch(match);
@@ -537,6 +629,7 @@ export function setupSocket(io) {
       const match = findCurrentMatch(areaId);
       if (!match) return emitError(socket, 'Chưa chọn trận');
       addReminder(io, match, side, kind);
+      if (kind === 'medical' && ![MATCH_STATUS.FINISHED, MATCH_STATUS.CANCELLED].includes(match.status)) startMedicalTimer(io, match, side);
       emitArea(io, areaId);
     });
 
@@ -584,11 +677,13 @@ export function setupSocket(io) {
       const area = getArea(areaId);
       const match = findCurrentMatch(areaId);
       if (!area || !match) return;
+      pushUndoState(match, `${getSideLabel(winner)} thắng trực tiếp`);
       match.winner = winner;
       match.winReason = reason;
       match.status = MATCH_STATUS.FINISHED;
       area.status = AREA_STATUS.IDLE;
       stopTimer(match.id);
+      stopAllMedicalTimers(match);
       pushHistory(match, { type: 'win', winner, label: `${getSideLabel(winner)} thắng trực tiếp` });
       touch(match);
       touch(area);
@@ -604,6 +699,7 @@ export function setupSocket(io) {
       match.status = MATCH_STATUS.FINISHED;
       area.status = AREA_STATUS.IDLE;
       stopTimer(match.id);
+      stopAllMedicalTimers(match);
       touch(match);
       touch(area);
       emitArea(io, areaId);
@@ -617,20 +713,44 @@ export function setupSocket(io) {
       area.currentFightMatchId = null;
       area.status = AREA_STATUS.IDLE;
       stopTimer(match.id);
+      stopAllMedicalTimers(match);
       touch(match);
       touch(area);
       emitArea(io, areaId);
     });
 
     socket.on('fight:undo', ({ areaId }) => {
+      const area = getArea(areaId);
       const match = findCurrentMatch(areaId);
       if (!match) return emitError(socket, 'Chưa chọn trận');
-      const last = [...match.history].reverse().find((item) => ['score', 'warning'].includes(item.type) && !item.undone);
-      if (!last) return emitError(socket, 'Không có điểm để hoàn tác');
-      if (last.side === 'red') match.redScore -= Number(last.points || 0);
-      if (last.side === 'blue') match.blueScore -= Number(last.points || 0);
-      last.undone = true;
-      pushHistory(match, { type: 'undo', label: `Hoàn tác: ${last.label}` });
+      if (!Array.isArray(match.undoStack) || match.undoStack.length === 0) return emitError(socket, 'Không có hành động chấm điểm để hoàn tác');
+      const snapshot = match.undoStack.pop();
+
+      stopTimer(match.id);
+      stopMedicalTimer(match.id, 'red');
+      stopMedicalTimer(match.id, 'blue');
+      match.redScore = snapshot.redScore;
+      match.blueScore = snapshot.blueScore;
+      match.reminders = snapshot.reminders;
+      match.medicalTimers = snapshot.medicalTimers;
+      match.medicalPauseResume = snapshot.medicalPauseResume;
+      match.winner = snapshot.winner;
+      match.winReason = snapshot.winReason;
+      match.status = snapshot.status;
+      match.history = (match.history || []).slice(0, snapshot.historyLength);
+      pushHistory(match, { type: 'undo', label: `Hoàn tác hành động: ${snapshot.label}` });
+
+      if (area) {
+        area.status = [MATCH_STATUS.RUNNING, MATCH_STATUS.GOLDEN].includes(match.status)
+          ? AREA_STATUS.FIGHTING_RUNNING
+          : match.status === MATCH_STATUS.PAUSED
+            ? AREA_STATUS.PAUSED
+            : AREA_STATUS.IDLE;
+        touch(area);
+      }
+      if ([MATCH_STATUS.RUNNING, MATCH_STATUS.GOLDEN].includes(match.status)) startTimer(io, match);
+      if (Number(match.medicalTimers?.red || 0) > 0) startMedicalTimer(io, match, 'red', match.medicalTimers.red);
+      if (Number(match.medicalTimers?.blue || 0) > 0) startMedicalTimer(io, match, 'blue', match.medicalTimers.blue);
       touch(match);
       emitArea(io, areaId);
     });

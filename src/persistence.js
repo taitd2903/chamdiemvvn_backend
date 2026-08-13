@@ -15,7 +15,12 @@ function cloneForStorage(state) {
 function applyLoadedState(target, loaded) {
   const safe = loaded && typeof loaded === 'object' ? loaded : {};
   target.settings = safe.settings && typeof safe.settings === 'object' ? { ...target.settings, ...safe.settings } : target.settings;
-  target.areas = Array.isArray(safe.areas) ? safe.areas : target.areas;
+  target.areas = Array.isArray(safe.areas) ? safe.areas.map((area) => {
+    if (area?.type !== 'fighting' || Number(area.judgeCount) !== 4) return area;
+    const judgeSlots = { ...(area.judgeSlots || {}) };
+    delete judgeSlots[4];
+    return { ...area, judgeCount: 3, judgeSlots };
+  }) : target.areas;
   target.contents = Array.isArray(safe.contents) ? safe.contents : target.contents;
   target.athletes = Array.isArray(safe.athletes) ? safe.athletes : target.athletes;
   target.registrations = Array.isArray(safe.registrations) ? safe.registrations : target.registrations;
